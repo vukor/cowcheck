@@ -11,12 +11,13 @@ import (
 	dockerClient "github.com/docker/docker/client"
 	"context"
 	"strings"
+	"syscall"
 	"github.com/dustin/go-humanize"
-  "github.com/prometheus/client_golang/prometheus/promhttp"
+  	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-var VERSION = "v0.2.0"
+var VERSION = "v0.3.0"
 
 var checkSlice = []CheckInterface{}
 
@@ -27,7 +28,7 @@ var metadataSpaceFree = uint64(0)
 // Primary representation of node health
 var nodeHealth = true
 
-// Generics
+// Config struct
 type Config struct {
 	logLevel	logrus.Level
 	pollInterval	int
@@ -78,6 +79,35 @@ func (c *Check) getName() string {
 type CheckDNS struct {
 	Check
 }
+
+// DiskStatus struct implemented from https://gist.github.com/lunny/9828326
+type DiskStatus struct {
+	All  uint64 `json:"all"`
+	Used uint64 `json:"used"`
+	Free uint64 `json:"free"`
+}
+
+// DiskUsage implemented from https://gist.github.com/lunny/9828326
+func DiskUsage(path string) (disk DiskStatus) {
+	fs := syscall.Statfs_t{}
+	err := syscall.Statfs(path, &fs)
+	if err != nil {
+		return
+	}
+	disk.All = fs.Blocks * uint64(fs.Bsize)
+	disk.Free = fs.Bfree * uint64(fs.Bsize)
+	disk.Used = disk.All - disk.Free
+	return
+}
+
+const (
+	B  = 1
+	KB = 1024 * B
+	MB = 1024 * KB
+	GB = 1024 * MB
+)
+// ********
+
 
 func prometheusHandler() http.Handler {
 	return promhttp.Handler()
@@ -176,7 +206,7 @@ func (c *CheckMetadata) eval() bool {
 
 // CheckStorage
 
-// CheckMetadata is a check for the Metadata Service
+// CheckStorage is a check for the Metadata Service
 type CheckStorage struct {
 	Check
 }
@@ -202,15 +232,13 @@ func (c *CheckStorage) eval() bool {
 		if err != nil {
 			panic(err)
 		}
+
+		disk := DiskUsage(info.DockerRootDir)
+		dataSpaceFree := float64(disk.Free)/float64(GB)
+		promDockerDataStorageFree.Set(dataSpaceFree)
+		logrus.Debugf("Found 'Data Space Available' value of %f", dataSpaceFree)
+
 		for _, item := range info.DriverStatus {
-			if item[0] == "Data Space Available" {
-				dataSpaceFree, err = humanize.ParseBytes(item[1])
-				if err != nil {
-					panic(err)
-				}
-				promDockerDataStorageFree.Set(float64(dataSpaceFree))
-				logrus.Debugf("Found 'Data Space Available' value of ", item[1])
-			}
 
 			if item[0] == "Metadata Space Available" {
 				metadataSpaceFree, err = humanize.ParseBytes(item[1])
@@ -218,11 +246,11 @@ func (c *CheckStorage) eval() bool {
 					panic(err)
 				}
 				promDockerMetadataStorageFree.Set(float64(metadataSpaceFree))
-				logrus.Debugf("Found 'Metadata Space Available' value of ", item[1])
+				logrus.Debugf("Found 'Metadata Space Available' value of %s", item[1])
 			}
 		}
 
-		if dataSpaceFree < c.cfg.dataStorageThreshold {
+		if uint64(dataSpaceFree) < c.cfg.dataStorageThreshold {
 			logrus.Errorf("'Data Space Available' is below threshold, failing storage check")
 			c.fail()
 		}
